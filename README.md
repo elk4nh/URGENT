@@ -24,10 +24,19 @@ sudo ./setup.sh
 The setup script will:
 - Install required packages (tor, proxychains4, sqlmap, curl)
 - Configure Tor for IP rotation
-- Set up Firefox to use Tor (if requested)
+- Set up Firefox to use Tor (optional - Firefox-ESR will be installed if not present)
 - Create test scripts
 - Configure auto-restart
 - Start the IP rotation daemon
+
+### Main Scripts
+
+After installation, these scripts will be available on your system:
+
+- `tor_proxy_setup.py` - The main script for managing Tor proxies
+- `/usr/local/bin/test-tor` - Script to test your Tor connection
+- `/usr/local/bin/firefox-tor` - Script to launch Firefox with Tor proxy
+- `/usr/local/bin/check_tor_proxy.sh` - Script that ensures the Tor proxy is running
 
 ## Basic Usage
 
@@ -51,19 +60,19 @@ proxychains4 curl https://api.ipify.org
 sudo python3 tor_proxy_setup.py [OPTIONS]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `--install` | Install tor, proxychains4, sqlmap and curl |
-| `--setup-firefox` | Configure Firefox to use Tor proxy |
-| `--rotate` | Rotate Tor IP address once |
-| `--daemon` | Run IP rotation daemon |
-| `--interval SECONDS` | IP rotation interval in seconds (default: 60) |
-| `--restart-tor` | Restart Tor service |
-| `--status` | Check Tor status and current IP |
-| `--auto-restart` | Setup auto-restart via crontab if script stops |
-| `--verify` | Verify Tor connection is working properly |
-| `--create-test` | Create a test script to verify Tor connection |
-| `--all` | Setup everything (install, Firefox setup, test script, daemon) |
+| Option | Description | Example |
+|--------|-------------|--------|
+| `--install` | Install tor, proxychains4, sqlmap and curl | `--install` |
+| `--setup-firefox` | Configure Firefox to use Tor proxy | `--setup-firefox` |
+| `--rotate` | Rotate Tor IP address once | `--rotate` |
+| `--daemon` | Run IP rotation daemon | `--daemon` |
+| `--interval SECONDS` | IP rotation interval in seconds (default: 60) | `--interval 120` |
+| `--restart-tor` | Restart Tor service | `--restart-tor` |
+| `--status` | Check Tor status and current IP | `--status` |
+| `--auto-restart` | Setup auto-restart via crontab if script stops | `--auto-restart` |
+| `--verify` | Verify Tor connection is working properly | `--verify` |
+| `--create-test` | Create a test script to verify Tor connection | `--create-test` |
+| `--all` | Setup everything (install, Firefox setup, test script, daemon) | `--all` |
 
 ### Multiple Tor Instances
 
@@ -73,13 +82,20 @@ sudo python3 tor_proxy_setup.py --multi-tor 5
 
 This creates 5 Tor instances with different IPs that can be used in parallel.
 
-| Option | Description |
-|--------|-------------|
-| `--multi-tor NUMBER` | Setup multiple Tor instances (specify number of instances) |
-| `--instance NUMBER` | Specify Tor instance number for operations |
-| `--list-instances` | List all available Tor instances |
-| `--delete-instance NUMBER` | Delete a specific Tor instance |
-| `--delete-all-instances` | Delete all Tor instances except the main one |
+| Option | Description | Example |
+|--------|-------------|--------|
+| `--multi-tor NUMBER` | Setup multiple Tor instances | `--multi-tor 5` |
+| `--instance NUMBER` | Specify Tor instance number for operations | `--rotate --instance 2` |
+| `--list-instances` | List all available Tor instances | `--list-instances` |
+| `--delete-instance NUMBER` | Delete a specific Tor instance | `--delete-instance 3` |
+| `--delete-all-instances` | Delete all Tor instances except the main one | `--delete-all-instances` |
+
+For example, to set up 3 Tor instances and rotate the IP of instance 2:
+
+```bash
+sudo python3 tor_proxy_setup.py --multi-tor 3
+sudo python3 tor_proxy_setup.py --rotate --instance 2
+```
 
 ### SQLMap Integration
 
@@ -98,37 +114,41 @@ sudo python3 multi_sqlmap_runner.py -i 5 -u "http://example.com/page.php?id=1" -
 Test your Tor connection:
 
 ```bash
-/usr/local/bin/test-tor
+test-tor
 ```
 
 Comprehensive test with instance selection:
 
 ```bash
-/usr/local/bin/test-tor -i 2 -c
+test-tor -i 2 -c
 ```
+
+Options:
+- `-i, --instance NUMBER` - Test a specific Tor instance (e.g., `test-tor -i 3`)
+- `-c, --comprehensive` - Run additional tests for DNS and WebRTC leaks
 
 ## Examples
 
-1. Check your current Tor IP:
-   ```bash
-   sudo python3 tor_proxy_setup.py --status
-   ```
+Basic usage examples with the main script:
 
-2. Manually rotate your Tor IP:
-   ```bash
-   sudo python3 tor_proxy_setup.py --rotate
-   ```
+```bash
+# Check your current Tor IP
+sudo python3 tor_proxy_setup.py --status
 
-3. Start IP rotation daemon with 2-minute interval:
-   ```bash
-   sudo python3 tor_proxy_setup.py --daemon --interval 120
-   ```
+# Manually rotate your Tor IP
+sudo python3 tor_proxy_setup.py --rotate
 
-4. Set up 3 Tor instances and run SQLMap through all of them:
-   ```bash
-   sudo python3 tor_proxy_setup.py --multi-tor 3
-   sudo python3 multi_sqlmap_runner.py -i 3 -u "http://example.com/page.php?id=1"
-   ```
+# Start IP rotation daemon with 2-minute interval
+sudo python3 tor_proxy_setup.py --daemon --interval 120
+
+# Set up 3 Tor instances and run SQLMap through all of them
+sudo python3 tor_proxy_setup.py --multi-tor 3
+sudo python3 multi_sqlmap_runner.py -i 3 -u "http://example.com/page.php?id=1"
+
+# Run normal commands through Tor
+proxychains4 curl https://api.ipify.org
+proxychains4 wget https://example.com/file.zip
+```
 
 ## Troubleshooting
 
