@@ -11,7 +11,6 @@ import subprocess
 import argparse
 import re
 from pathlib import Path
-
 from stem import Signal
 from stem.control import Controller
 
@@ -352,6 +351,9 @@ def rotate_ip(instance_num=None, control_port=9051):
     try:
         # Try using stem library first
         try:
+            from stem import Signal
+            from stem.control import Controller
+
             with Controller.from_port(port=control_port) as controller:
                 controller.authenticate()
                 controller.signal(Signal.NEWNYM)
