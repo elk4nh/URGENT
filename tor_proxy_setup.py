@@ -1,5 +1,1683 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 
+import os
+import sys
+import time
+import socket
+import random
+import signal
+import subprocess
+import argparse
+import re
+from pathlib import Path
+
+import args
+from stem import Signal
+from stem.control import Controller
+
+# Global variables
+DEFAULT_INTERVAL = 60  # Default IP rotation interval in seconds
+
+def run_command(command):
+    """Run a shell command and return the output"""
+    try:
+        result = subprocess.run(command, shell=True, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing command: {command}")
+        print(f"Error message: {e.stderr}")
+        return None
+
+def install_packages():
+    """Install required packages: tor, proxychains4, sqlmap, curl"""
+    print("[*] Installing required packages...")
+
+    # Check if packages are already installed
+    tor_installed = run_command("which tor") is not None
+    proxychains_installed = run_command("which proxychains4") is not None
+    sqlmap_installed = run_command("which sqlmap") is not None
+    curl_installed = run_command("which curl") is not None
+
+    # Install missing packages
+    if not tor_installed or not proxychains_installed or not sqlmap_installed or not curl_installed:
+        # Update package lists
+        print("[*] Updating package lists...")
+        run_command("apt-get update")
+
+    # Install Tor if not already installed
+    if not tor_installed:
+        print("[*] Installing Tor...")
+        run_command("apt-get install -y tor")
+        run_command("systemctl enable tor")
+        run_command("systemctl start tor")
+    else:
+        print("[+] Tor is already installed.")
+
+    # Install proxychains4 if not already installed
+    if not proxychains_installed:
+        print("[*] Installing proxychains4...")
+        run_command("apt-get install -y proxychains4")
+    else:
+        print("[+] Proxychains4 is already installed.")
+
+    # Install SQLMap if not already installed
+    if not sqlmap_installed:
+        print("[*] Installing SQLMap...")
+        run_command("apt-get install -y sqlmap")
+    else:
+        print("[+] SQLMap is already installed.")
+
+    # Install curl if not already installed
+    if not curl_installed:
+        print("[*] Installing curl...")
+        run_command("apt-get install -y curl")
+    else:
+        print("[+] Curl is already installed.")
+
+    # Configure Tor for control port access
+    print("[*] Configuring Tor...")
+    torrc_path = "/etc/tor/torrc"
+    torrc_backup = "/etc/tor/torrc.backup"
+
+    # Backup original torrc if it hasn't been backed up already
+    if not os.path.exists(torrc_backup) and os.path.exists(torrc_path):
+        run_command(f"cp {torrc_path} {torrc_backup}")
+
+    # Update torrc configuration
+    torrc_config = """
+# Tor configuration for proxy rotation
+ControlPort 9051
+SocksPort 9050
+DataDirectory /var/lib/tor
+CookieAuthentication 1
+HashedControlPassword """
+
+    # Generate hashed control password
+    password = "TorProxyManager" + str(random.randint(1000, 9999))
+    hashed_password = run_command(f"tor --hash-password {password}")
+    torrc_config += hashed_password + "\n"
+
+    # Write the configuration to torrc
+    with open("/tmp/torrc", "w") as f:
+        f.write(torrc_config)
+
+    run_command(f"sudo mv /tmp/torrc {torrc_path}")
+    run_command("sudo chmod 644 /etc/tor/torrc")
+
+    # Configure proxychains to use Tor
+    proxychains_conf = "/etc/proxychains4.conf"
+    proxychains_backup = "/etc/proxychains4.conf.backup"
+
+    # Backup original proxychains.conf if it hasn't been backed up already
+    if not os.path.exists(proxychains_backup) and os.path.exists(proxychains_conf):
+        run_command(f"cp {proxychains_conf} {proxychains_backup}")
+
+    proxychains_config = """
+# proxychains.conf for Tor proxy rotation
+strict_chain
+proxy_dns
+remote_dns_subnet 224
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+
+[ProxyList]
+socks5 127.0.0.1 9050
+"""
+
+    with open("/tmp/proxychains4.conf", "w") as f:
+        f.write(proxychains_config)
+
+    run_command(f"sudo mv /tmp/proxychains4.conf {proxychains_conf}")
+    run_command("sudo chmod 644 /etc/proxychains4.conf")
+
+    # Restart Tor service
+    print("[*] Restarting Tor service...")
+    run_command("systemctl restart tor")
+
+    print("[+] Required packages installed and configured successfully.")
+    return True
+
+def check_tor_status():
+    """Check if Tor service is running"""
+    result = run_command("systemctl is-active tor")
+    if result == "active":
+        return True
+    return False
+
+def restart_tor(instance_num=None):
+    """Restart the Tor service or a specific Tor instance"""
+    if instance_num is not None:
+        data_dir = f"/var/lib/tor/instance_{instance_num}"
+        if os.path.exists(data_dir):
+            pid_file = os.path.join(data_dir, "pid")
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file, "r") as f:
+                        pid = f.read().strip()
+                    if pid:
+                        print(f"[*] Restarting Tor instance {instance_num} (PID: {pid})...")
+                        run_command(f"kill -HUP {pid}")
+                        time.sleep(5)  # Wait for Tor to restart
+                        return True
+                except Exception as e:
+                    print(f"[!] Error restarting Tor instance {instance_num}: {str(e)}")
+
+            # If PID file doesn't exist or there was an error, try to start the instance
+            start_tor_instance(instance_num)
+            return True
+        else:
+            print(f"[!] Tor instance {instance_num} doesn't exist. Create it first with --multi-tor.")
+            return False
+    else:
+        print("[*] Restarting the main Tor service...")
+        run_command("systemctl restart tor")
+        time.sleep(5)  # Wait for Tor to restart
+        if check_tor_status():
+            print("[+] Tor service restarted successfully.")
+            return True
+        else:
+            print("[!] Failed to restart Tor service.")
+            return False
+
+def get_current_ip(socks_port=9050):
+    """Get the current Tor IP address"""
+    cmd = f"proxychains4 -q -f /etc/proxychains4.conf{'.'+str(socks_port) if socks_port != 9050 else ''} curl -s https://api.ipify.org"
+    ip = run_command(cmd)
+    if not ip or not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+        print(f"[!] Could not get current IP address for port {socks_port}.")
+        return None
+    return ip
+
+def start_tor_instance(instance_num):
+    """Start a Tor instance with a specific port"""
+    socks_port = 9050 + instance_num
+    control_port = 9051 + instance_num
+    data_dir = f"/var/lib/tor/instance_{instance_num}"
+
+    # Create data directory if it doesn't exist
+    if not os.path.exists(data_dir):
+        run_command(f"mkdir -p {data_dir}")
+        run_command(f"chown debian-tor:debian-tor {data_dir}")
+        run_command(f"chmod 700 {data_dir}")
+
+    # Create torrc configuration for this instance
+    torrc_path = f"/etc/tor/torrc.{instance_num}"
+    torrc_config = f"""
+# Tor configuration for instance {instance_num}
+SocksPort {socks_port}
+ControlPort {control_port}
+DataDirectory {data_dir}
+CookieAuthentication 1
+HashedControlPassword 16:B92771A5F21A091BA5CDD5C63965239FD2ED5D2C425EE638CA804F121B
+"""
+
+    with open("/tmp/torrc.instance", "w") as f:
+        f.write(torrc_config)
+
+    run_command(f"sudo mv /tmp/torrc.instance {torrc_path}")
+    run_command(f"sudo chmod 644 {torrc_path}")
+
+    # Create proxychains configuration for this instance
+    proxychains_conf = f"/etc/proxychains4.conf.{socks_port}"
+    proxychains_config = f"""
+# proxychains.conf for Tor instance {instance_num}
+strict_chain
+proxy_dns
+remote_dns_subnet 224
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+
+[ProxyList]
+socks5 127.0.0.1 {socks_port}
+"""
+
+    with open("/tmp/proxychains4.conf.instance", "w") as f:
+        f.write(proxychains_config)
+
+    run_command(f"sudo mv /tmp/proxychains4.conf.instance {proxychains_conf}")
+    run_command(f"sudo chmod 644 {proxychains_conf}")
+
+    # Start Tor instance
+    print(f"[*] Starting Tor instance {instance_num} on port {socks_port}...")
+    cmd = f"tor -f {torrc_path}"
+    run_command(f"sudo -u debian-tor {cmd} &")
+
+    # Wait for Tor to start
+    time.sleep(5)
+
+    # Check if the instance is running
+    is_running = False
+    for _ in range(5):  # Try 5 times
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(("127.0.0.1", socks_port))
+                is_running = True
+                break
+        except:
+            time.sleep(2)
+
+    if is_running:
+        print(f"[+] Tor instance {instance_num} started successfully.")
+        return True
+    else:
+        print(f"[!] Failed to start Tor instance {instance_num}.")
+        return False
+
+def setup_multiple_tor_instances(num_instances):
+    """Setup multiple Tor instances with different IPs"""
+    print(f"[*] Setting up {num_instances} Tor instances...")
+
+    # Create instances
+    successful_instances = 0
+    for i in range(1, num_instances + 1):
+        if start_tor_instance(i):
+            successful_instances += 1
+
+    # Rotate IPs to ensure they're different
+    for i in range(1, num_instances + 1):
+        rotate_ip(i)
+        time.sleep(1)  # Add delay to avoid overwhelming the Tor network
+
+    print(f"[+] Successfully set up {successful_instances} out of {num_instances} Tor instances.")
+
+    # List all instances with their IPs
+    print("\n[*] Tor instance information:")
+    print("-" * 50)
+    print(f"{'Instance':<10} {'SOCKS Port':<15} {'Control Port':<15} {'IP Address':<20}")
+    print("-" * 50)
+
+    # First show the main Tor instance
+    main_ip = get_current_ip()
+    print(f"{'Main':<10} {'9050':<15} {'9051':<15} {main_ip if main_ip else 'Not available':<20}")
+
+    for i in range(1, num_instances + 1):
+        socks_port = 9050 + i
+        control_port = 9051 + i
+        ip = get_current_ip(socks_port)
+        print(f"{i:<10} {socks_port:<15} {control_port:<15} {ip if ip else 'Not available':<20}")
+
+    print("-" * 50)
+    return successful_instances
+
+def verify_tor_connection(socks_port=9050):
+    """Verify that Tor connection is working properly"""
+    print("[*] Verifying Tor connection...")
+
+    # Check if Tor is running
+    if socks_port == 9050:
+        if not check_tor_status():
+            print("[!] Tor service is not running. Starting Tor...")
+            run_command("systemctl start tor")
+            time.sleep(5)  # Wait for Tor to start
+
+    # Get current Tor IP
+    ip = get_current_ip(socks_port)
+    if not ip:
+        print("[!] Could not get Tor IP address. Tor may not be working correctly.")
+        return False
+
+    print(f"[+] Current Tor IP: {ip}")
+
+    # Check if we can access the Tor check service
+    tor_check_cmd = f"proxychains4 -q -f /etc/proxychains4.conf{'.'+str(socks_port) if socks_port != 9050 else ''} curl -s https://check.torproject.org"
+    tor_check_result = run_command(tor_check_cmd)
+
+    if tor_check_result and "Congratulations" in tor_check_result:
+        print("[+] Tor connection verified via check.torproject.org")
+    else:
+        print("[!] Could not verify Tor connection via check.torproject.org")
+
+    # Compare with direct IP to ensure they're different
+    direct_ip_cmd = "curl -s https://api.ipify.org"
+    direct_ip = run_command(direct_ip_cmd)
+
+    if direct_ip and ip and direct_ip == ip:
+        print("[!] Warning: Your Tor IP matches your direct IP. Tor may not be working correctly.")
+        return False
+
+    print(f"[+] Tor connection verified! Your Tor IP is: {ip}")
+    return True
+
+def rotate_ip(instance_num=None, control_port=9051):
+    """Rotate Tor IP address for a specific instance or main Tor"""
+    socks_port = 9050
+    if instance_num is not None:
+        socks_port = 9050 + instance_num
+        control_port = 9051 + instance_num
+
+    old_ip = get_current_ip(socks_port)
+    print(f"[*] Current IP for port {socks_port}: {old_ip}")
+    print(f"[*] Rotating IP address for port {socks_port}...")
+
+    try:
+        # Try using stem library first
+        try:
+            from stem import Signal
+            from stem.control import Controller
+
+            with Controller.from_port(port=control_port) as controller:
+                controller.authenticate()
+                controller.signal(Signal.NEWNYM)
+                print("[+] Successfully rotated IP address using stem library.")
+        except:
+            # If stem fails, try the manual telnet method
+            print("[!] Stem library not available or failed. Trying manual method...")
+
+            # Create a temporary script to send commands to the Tor control port
+            auth_script = f"""
+#!/usr/bin/env python3
+import socket, time
+
+def send_tor_command(cmd):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(('127.0.0.1', {control_port}))
+    auth_response = s.recv(1024).decode()
+    s.send(('AUTHENTICATE ""\r\n').encode())
+    auth_response = s.recv(1024).decode()
+    s.send((cmd + '\r\n').encode())
+    response = s.recv(1024).decode()
+    s.close()
+    return response
+
+# Send NEWNYM signal to rotate IP
+print(send_tor_command('SIGNAL NEWNYM'))
+time.sleep(2)  # Wait for rotation
+"""
+
+            with open("/tmp/rotate_tor_ip.py", "w") as f:
+                f.write(auth_script)
+
+            run_command("chmod +x /tmp/rotate_tor_ip.py")
+            run_command("python3 /tmp/rotate_tor_ip.py")
+            run_command("rm /tmp/rotate_tor_ip.py")
+
+        # Wait for IP to change
+        time.sleep(5)
+
+        # Verify IP change
+        new_ip = get_current_ip(socks_port)
+        print(f"[*] New IP for port {socks_port}: {new_ip}")
+
+        if old_ip and new_ip and old_ip == new_ip:
+            print("[!] Warning: IP address did not change. Trying again...")
+            # Try the rotation once more
+            try:
+                with Controller.from_port(port=control_port) as controller:
+                    controller.authenticate()
+                    controller.signal(Signal.NEWNYM)
+            except:
+                pass
+
+            time.sleep(5)
+            new_ip = get_current_ip(socks_port)
+            print(f"[*] New IP after second attempt: {new_ip}")
+
+            if old_ip and new_ip and old_ip == new_ip:
+                print("[!] IP rotation failed. Try restarting Tor.")
+                return False
+
+        return True
+    except Exception as e:
+        print(f"[!] Error rotating IP: {str(e)}")
+        return False
+
+def setup_firefox_proxy():
+    """Configure Firefox to use Tor as proxy"""
+    print("[*] Setting up Firefox to use Tor proxy...")
+
+    # Create a script to launch Firefox with Tor proxy
+    firefox_script_path = "/usr/local/bin/firefox-tor"
+    firefox_script = """#!/bin/bash
+# Script to launch Firefox with Tor proxy
+firefox -no-remote -profile "$(mktemp -d)" \
+    -P "TorProfile" \
+    -preferences \
+    -purgecaches \
+    -new-instance \
+    -proxy-server="socks5://127.0.0.1:9050" $@
+"""
+
+    with open("/tmp/firefox-tor", "w") as f:
+        f.write(firefox_script)
+
+    run_command("sudo mv /tmp/firefox-tor " + firefox_script_path)
+    run_command(f"sudo chmod +x {firefox_script_path}")
+
+    print(f"[+] Firefox proxy setup completed. Run '{firefox_script_path}' to launch Firefox with Tor proxy.")
+    print("[+] Note: This is a CLI-only solution for VPS as requested.")
+
+def create_test_script():
+    """Create a test script to verify Tor connection"""
+    print("[*] Creating test script...")
+
+    test_script_path = "/usr/local/bin/test-tor"
+    test_script = """#!/bin/bash
+# Script to test Tor connection
+
+# ASCII Art Banner
+cat << "EOF"
+  _______            _______         _   
+ |__   __|          |__   __|       | |  
+    | | ___  _ __      | | ___  ___| |_ 
+    | |/ _ \| '__|     | |/ _ \/ __| __|
+    | | (_) | |        | |  __/\__ \ |_ 
+    |_|\___/|_|        |_|\___||___/\__|
+
+EOF
+
+# Parse command-line arguments
+INSTANCE=""
+COMPREHENSIVE=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -i|--instance)
+            INSTANCE="$2"
+            shift 2
+            ;;
+        -c|--comprehensive)
+            COMPREHENSIVE=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: test-tor [-i|--instance NUM] [-c|--comprehensive]"
+            exit 1
+            ;;
+    esac
+done
+
+# Determine which Tor instance to test
+if [ -z "$INSTANCE" ]; then
+    PROXY_PORT=9050
+    PROXY_CONFIG="/etc/proxychains4.conf"
+    INSTANCE_NAME="Main Tor"
+else
+    PROXY_PORT=$((9050 + INSTANCE))
+    PROXY_CONFIG="/etc/proxychains4.conf.$PROXY_PORT"
+    INSTANCE_NAME="Tor Instance $INSTANCE"
+
+    # Check if this instance exists
+    if [ ! -f "$PROXY_CONFIG" ]; then
+        echo "[!] Error: Tor instance $INSTANCE does not exist."
+        echo "[!] Create it first with: sudo python3 tor_proxy_setup.py --multi-tor $INSTANCE"
+        exit 1
+    fi
+fi
+
+echo "\n===== Testing $INSTANCE_NAME (Port: $PROXY_PORT) ====="
+
+# Get direct IP
+echo -n "[*] Your direct IP address: "
+DIRECT_IP=$(curl -s https://api.ipify.org)
+echo "$DIRECT_IP"
+
+# Get Tor IP
+echo -n "[*] Your Tor IP address: "
+TOR_IP=$(proxychains4 -q -f "$PROXY_CONFIG" curl -s https://api.ipify.org)
+echo "$TOR_IP"
+
+# Check if IPs are different
+if [ "$DIRECT_IP" = "$TOR_IP" ]; then
+    echo "[!] WARNING: Your Tor IP is the same as your direct IP!"
+    echo "[!] Tor may not be working correctly."
+    exit 1
+fi
+
+# Get IP location information
+echo "\n[*] IP Location Information:"
+TOR_LOCATION=$(proxychains4 -q -f "$PROXY_CONFIG" curl -s https://ipinfo.io)
+COUNTRY=$(echo "$TOR_LOCATION" | grep -oP '"country":\s*"\K[^"]*')
+CITY=$(echo "$TOR_LOCATION" | grep -oP '"city":\s*"\K[^"]*')
+ISP=$(echo "$TOR_LOCATION" | grep -oP '"org":\s*"\K[^"]*')
+
+echo "[+] Country: $COUNTRY"
+echo "[+] City: $CITY"
+echo "[+] ISP/Organization: $ISP"
+
+# Check Tor verification
+echo "\n[*] Verifying Tor connection..."
+TOR_CHECK=$(proxychains4 -q -f "$PROXY_CONFIG" curl -s https://check.torproject.org/api/ip)
+IS_TOR=$(echo "$TOR_CHECK" | grep -oP '"IsTor":\s*\K\w+')
+
+if [ "$IS_TOR" = "true" ]; then
+    echo "[+] Success! You are connected to the Tor network."
+else
+    echo "[!] Warning: You may not be using Tor properly."
+fi
+
+# Test latency
+echo "\n[*] Testing connection latency..."
+echo -n "[+] Direct connection: "
+DIRECT_TIME=$(curl -s -w "%{time_total}" -o /dev/null https://www.google.com)
+printf "%.2f seconds\n" "$DIRECT_TIME"
+
+echo -n "[+] Tor connection: "
+TOR_TIME=$(proxychains4 -q -f "$PROXY_CONFIG" curl -s -w "%{time_total}" -o /dev/null https://www.google.com)
+printf "%.2f seconds\n" "$TOR_TIME"
+
+# Comprehensive tests if requested
+if [ "$COMPREHENSIVE" = true ]; then
+    echo "\n===== Running Comprehensive Tests ====="
+
+    # DNS leak test
+    echo "\n[*] Testing for DNS leaks..."
+    DNS_SERVERS=$(proxychains4 -q -f "$PROXY_CONFIG" curl -s https://dnsleaktest.com/json/api-dns-leak-test | grep -oP '"ip":\s*"\K[^"]*')
+    DNS_COUNT=$(echo "$DNS_SERVERS" | wc -l)
+
+    echo "[+] DNS servers detected: $DNS_COUNT"
+    if [ "$DNS_COUNT" -gt 1 ]; then
+        echo "[!] Warning: Multiple DNS servers detected, possible DNS leak."
+    else
+        echo "[+] Good: Only using one DNS server through Tor."
+    fi
+
+    # Browser warning
+    echo "\n[*] Browser Security Recommendations:"
+    echo "[!] Remember that using Tor with a regular browser may still leak your identity."
+    echo "[!] For maximum anonymity, use the official Tor Browser instead."
+    echo "[!] Browser plugins, JavaScript, WebRTC, and cookies can all reveal your true IP."
+
+    # Check for common Tor exit nodes
+    echo "\n[*] Checking if your exit node is a common one..."
+    EXIT_NODE_IP="$TOR_IP"
+    TOR_EXIT_DB="https://check.torproject.org/exit-addresses"
+    KNOWN_EXIT=$(curl -s "$TOR_EXIT_DB" | grep "ExitAddress $EXIT_NODE_IP" | wc -l)
+
+    if [ "$KNOWN_EXIT" -gt 0 ]; then
+        echo "[+] Your Tor exit node is a known exit node in the public directory."
+    else
+        echo "[!] Your exit node is not in the public Tor directory. This could be normal for a bridge relay."
+    fi
+fi
+
+echo "\n===== Test Completed Successfully ====="
+echo "[+] Your Tor connection is working properly."
+echo "[+] Your real IP is hidden: $DIRECT_IP -> $TOR_IP"
+"""
+
+    with open("/tmp/test-tor", "w") as f:
+        f.write(test_script)
+
+    run_command("sudo mv /tmp/test-tor " + test_script_path)
+    run_command(f"sudo chmod +x {test_script_path}")
+
+    print(f"[+] Test script created at {test_script_path}")
+    print("[+] Run the script to test your Tor connection.")
+
+def ip_rotation_daemon(interval=60, instance_num=None, instances=None):
+    """Run IP rotation daemon"""
+    if instance_num is not None:
+        print(f"[*] Starting IP rotation daemon for instance {instance_num} with interval {interval} seconds...")
+    elif instances is not None:
+        print(f"[*] Starting IP rotation daemon for {len(instances)} instances with interval {interval} seconds...")
+    else:
+        print(f"[*] Starting IP rotation daemon with interval {interval} seconds...")
+
+    try:
+        while True:
+            if instance_num is not None:
+                rotate_ip(instance_num)
+            elif instances is not None:
+                for i in instances:
+                    print(f"\n--- Rotating IP for instance {i} ---")
+                    rotate_ip(i)
+                    time.sleep(1)  # Small delay between rotations
+            else:
+                rotate_ip()
+
+            # Sleep until next rotation
+            print(f"[*] Next IP rotation in {interval} seconds...")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[!] IP rotation daemon stopped by user.")
+    except Exception as e:
+        print(f"\n[!] Error in IP rotation daemon: {str(e)}")
+
+def add_crontab_entry(interval=60):
+    """Add crontab entry to auto-restart the script if it stops"""
+    print("[*] Setting up auto-restart via crontab...")
+
+    # Create a check script that will run periodically
+    script_path = "/usr/local/bin/check_tor_proxy.sh"
+    script_content = f"""#!/bin/bash
+# Script to check if tor_proxy_setup.py daemon is running and restart if not
+
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROXY_SCRIPT="{os.path.abspath(__file__)}"
+LOG_FILE="/var/log/tor_proxy.log"
+
+# Check if daemon is running
+if ! pgrep -f "python3 $PROXY_SCRIPT --daemon" > /dev/null; then
+    echo "[$(date)] Tor proxy daemon not running. Restarting..." >> "$LOG_FILE"
+    nohup python3 "$PROXY_SCRIPT" --daemon --interval {interval} >> "$LOG_FILE" 2>&1 &
+fi
+"""
+
+    with open("/tmp/check_tor_proxy.sh", "w") as f:
+        f.write(script_content)
+
+    run_command(f"sudo mv /tmp/check_tor_proxy.sh {script_path}")
+    run_command(f"sudo chmod +x {script_path}")
+
+    # Add crontab entry to run the check script every 5 minutes
+    crontab_entry = f"*/5 * * * * {script_path}\n"
+    run_command(f"(crontab -l 2>/dev/null || echo '') | grep -v '{script_path}' | (cat; echo '{crontab_entry}') | crontab -")
+
+    print("[+] Auto-restart setup completed. The script will be monitored and restarted if it stops.")
+    return True
+
+def measure_latency(test_url="https://api.ipify.org", proxy_config=None, num_tests=3):
+    """Measure latency difference between direct and Tor connections"""
+    results = {"direct": {"times": [], "timeouts": 0, "avg": 0},
+              "tor": {"times": [], "timeouts": 0, "avg": 0}}
+
+    print("[*] Measuring latency...")
+    print(f"[*] Running {num_tests} tests for direct connection...")
+
+    # Test direct connection
+    direct_times = []
+    for i in range(num_tests):
+        try:
+            start_time = time.time()
+            result = run_command(f"curl -s -m 10 {test_url}")
+            elapsed = time.time() - start_time
+
+            if result:
+                direct_times.append(elapsed)
+                print(f"  Test {i+1}: {elapsed:.2f} seconds")
+            else:
+                results["direct"]["timeouts"] += 1
+                print(f"  Test {i+1}: Timeout")
+        except:
+            results["direct"]["timeouts"] += 1
+            print(f"  Test {i+1}: Error")
+
+    # Calculate average direct latency
+    if direct_times:
+        avg_direct = sum(direct_times) / len(direct_times)
+        results["direct"]["times"] = direct_times
+        results["direct"]["avg"] = avg_direct
+        print(f"[+] Average direct latency: {avg_direct:.2f} seconds")
+    else:
+        print("[!] Could not measure direct latency.")
+
+    # Determine proxy configuration
+    if not proxy_config:
+        proxy_config = "/etc/proxychains4.conf"
+
+    # Test Tor connection
+    print(f"\n[*] Running {num_tests} tests for Tor connection...")
+    tor_times = []
+    for i in range(num_tests):
+        try:
+            start_time = time.time()
+            cmd = f"proxychains4 -q -f {proxy_config} curl -s -m 30 {test_url}"
+            result = run_command(cmd)
+            elapsed = time.time() - start_time
+
+            if result:
+                tor_times.append(elapsed)
+                print(f"  Test {i+1}: {elapsed:.2f} seconds")
+            else:
+                results["tor"]["timeouts"] += 1
+                print(f"  Test {i+1}: Timeout")
+        except:
+            results["tor"]["timeouts"] += 1
+            print(f"  Test {i+1}: Error")
+
+    # Calculate average Tor latency
+    if tor_times:
+        avg_tor = sum(tor_times) / len(tor_times)
+        results["tor"]["times"] = tor_times
+        results["tor"]["avg"] = avg_tor
+        print(f"[+] Average Tor latency: {avg_tor:.2f} seconds")
+    else:
+        print("[!] Could not measure Tor latency.")
+
+    # Calculate overhead
+    if direct_times and tor_times:
+        overhead = (avg_tor / avg_direct) - 1
+        print(f"[+] Tor overhead: {overhead:.2f}x (Tor is {overhead*100:.0f}% slower)")
+
+    return results
+
+def test_dns_leak(proxy_config=None):
+    """Test for DNS leaks"""
+    results = {}
+
+    if not proxy_config:
+        proxy_config = "/etc/proxychains4.conf"
+
+    print("[*] Testing for DNS leaks...")
+    try:
+        # Try to get DNS servers from dnsleaktest.com
+        cmd = f"proxychains4 -q -f {proxy_config} curl -s https://dnsleaktest.com/json/api-dns-leak-test"
+        output = run_command(cmd)
+
+        if output and output.strip():
+            dns_servers = re.findall(r'"ip":\s*"([^"]+)"', output)
+
+            if dns_servers:
+                results["dns_servers"] = dns_servers
+                results["count"] = len(dns_servers)
+
+                print(f"[+] Detected {len(dns_servers)} DNS servers:")
+                for server in dns_servers:
+                    print(f"  - {server}")
+
+                if len(dns_servers) > 1:
+                    print("[!] Warning: Multiple DNS servers detected. Possible DNS leak.")
+                    results["leaked"] = True
+                else:
+                    print("[+] Good: Only one DNS server detected.")
+                    results["leaked"] = False
+            else:
+                print("[!] No DNS servers detected in the response.")
+                results["error"] = "No DNS servers found in response"
+        else:
+            print("[!] Could not get DNS leak test results.")
+            results["error"] = "No response from DNS leak test"
+    except Exception as e:
+        print(f"[!] Error testing for DNS leaks: {str(e)}")
+        results["error"] = str(e)
+
+    return results
+
+def test_webrtc_leak(proxy_config=None):
+    """Test for WebRTC leaks (conceptual, can't be fully tested from CLI)"""
+    results = {"warning": "WebRTC leak testing requires a browser environment"}
+    print("[*] WebRTC leak testing from CLI is limited.")
+    print("[+] Important notes about WebRTC leaks:")
+    print("  - WebRTC can bypass proxy settings in browsers and reveal your real IP")
+    print("  - This cannot be fully tested from a command-line environment")
+    print("  - For proper WebRTC leak testing, use a browser with appropriate extensions")
+    print("  - Consider using the Tor Browser which has WebRTC disabled by default")
+
+    return results
+
+def ip_rotation_daemon(interval=60, instance_num=None, instances=None):
+    """Run IP rotation daemon"""
+    if instance_num is not None:
+        print(f"[*] Starting IP rotation daemon for instance {instance_num} with interval {interval} seconds...")
+    elif instances is not None:
+        print(f"[*] Starting IP rotation daemon for {len(instances)} instances with interval {interval} seconds...")
+    else:
+        print(f"[*] Starting IP rotation daemon with interval {interval} seconds...")
+
+    try:
+        while True:
+            if instance_num is not None:
+                rotate_ip(instance_num)
+            elif instances is not None:
+                for i in instances:
+                    print(f"\n--- Rotating IP for instance {i} ---")
+                    rotate_ip(i)
+                    time.sleep(1)  # Small delay between rotations
+            else:
+                rotate_ip()
+
+            # Sleep until next rotation
+            print(f"[*] Next IP rotation in {interval} seconds...")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[!] IP rotation daemon stopped by user.")
+    except Exception as e:
+        print(f"\n[!] Error in IP rotation daemon: {str(e)}")
+
+def get_ip_info(proxy_config=None):
+    """Get detailed information about the current IP address"""
+    results = {}
+
+    cmd_prefix = ""
+    if proxy_config:
+        cmd_prefix = f"proxychains4 -q -f {proxy_config} "
+
+    print("[*] Getting IP information...")
+    try:
+        # Get basic IP
+        ip_cmd = f"{cmd_prefix}curl -s https://api.ipify.org"
+        ip = run_command(ip_cmd)
+
+        if ip and re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+            results["ip"] = ip
+            print(f"[+] IP Address: {ip}")
+
+            # Get detailed info from ipinfo.io
+            info_cmd = f"{cmd_prefix}curl -s https://ipinfo.io"
+            info = run_command(info_cmd)
+
+            if info:
+                # Parse fields from the JSON response
+                for field in ["country", "region", "city", "org", "hostname", "loc"]:
+                    match = re.search(r'"' + field + '":\s*"([^"]+)"', info)
+                    if match:
+                        results[field] = match.group(1)
+
+                # Display the information
+                if "city" in results and "country" in results:
+                    print(f"[+] Location: {results.get('city', 'Unknown')}, {results.get('country', 'Unknown')}")
+                if "org" in results:
+                    print(f"[+] ISP/Organization: {results.get('org', 'Unknown')}")
+        else:
+            print("[!] Could not get IP address information.")
+    except Exception as e:
+        print(f"[!] Error getting IP information: {str(e)}")
+
+    return results
+
+def add_crontab_entry(interval=60):
+    """Add crontab entry to auto-restart the script if it stops"""
+    print("[*] Setting up auto-restart via crontab...")
+
+    # Create a check script that will run periodically
+    script_path = "/usr/local/bin/check_tor_proxy.sh"
+    script_content = f"""#!/bin/bash
+    # Script to check if tor_proxy_setup.py daemon is running and restart if not
+
+    CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PROXY_SCRIPT="{os.path.abspath(__file__)}"
+    LOG_FILE="/var/log/tor_proxy.log"
+
+    # Check if daemon is running
+    if ! pgrep -f "python3 $PROXY_SCRIPT --daemon" > /dev/null; then
+    echo "[$(date)] Tor proxy daemon not running. Restarting..." >> "$LOG_FILE"
+    nohup python3 "$PROXY_SCRIPT" --daemon --interval {interval} >> "$LOG_FILE" 2>&1 &
+    fi
+    """
+
+    with open("/tmp/check_tor_proxy.sh", "w") as f:
+        f.write(script_content)
+
+    run_command(f"sudo mv /tmp/check_tor_proxy.sh {script_path}")
+    run_command(f"sudo chmod +x {script_path}")
+
+    # Add crontab entry to run the check script every 5 minutes
+    crontab_entry = f"*/5 * * * * {script_path}\n"
+    run_command(f"(crontab -l 2>/dev/null || echo '') | grep -v '{script_path}' | {{ {{ cat; echo '{crontab_entry}'; }} | crontab -}}")
+
+    print("[+] Auto-restart setup completed. The script will be monitored and restarted if it stops.")
+    return True
+
+def check_tor_connection(proxy_config=None):
+    """Check if the connection is using Tor"""
+    results = {"is_tor": False}
+
+    if not proxy_config:
+        proxy_config = "/etc/proxychains4.conf"
+
+    print("[*] Checking if connection is using Tor...")
+    try:
+        # Try to access the Tor Project's checker API
+        cmd = f"proxychains4 -q -f {proxy_config} curl -s https://check.torproject.org/api/ip"
+        output = run_command(cmd)
+
+        if output and "IsTor" in output:
+            is_tor = "true" in output.lower()
+            results["is_tor"] = is_tor
+
+            if is_tor:
+                print("[+] Connection confirmed to be using Tor.")
+            else:
+                print("[!] Connection is NOT using Tor.")
+
+            # Extract IP from the response
+            ip_match = re.search(r'"IP":\s*"([^"]+)"', output)
+            if ip_match:
+                results["ip"] = ip_match.group(1)
+        else:
+            print("[!] Could not determine if connection is using Tor.")
+    except Exception as e:
+        print(f"[!] Error checking Tor connection: {str(e)}")
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="Tor Proxy Manager with IP Rotation")
+
+    # Basic options
+    parser.add_argument("--install", action="store_true", help="Install tor, proxychains4, sqlmap and curl")
+    parser.add_argument("--setup-firefox", action="store_true", help="Configure Firefox to use Tor proxy")
+    parser.add_argument("--rotate", action="store_true", help="Rotate Tor IP address once")
+    parser.add_argument("--daemon", action="store_true", help="Run IP rotation daemon")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help=f"IP rotation interval in seconds (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--restart-tor", action="store_true", help="Restart Tor service")
+    parser.add_argument("--status", action="store_true", help="Check Tor status and current IP")
+    parser.add_argument("--auto-restart", action="store_true", help="Setup auto-restart via crontab if script stops")
+    parser.add_argument("--verify", action="store_true", help="Verify Tor connection is working properly")
+    parser.add_argument("--create-test", action="store_true", help="Create a test script to verify Tor connection")
+    parser.add_argument("--all", action="store_true", help="Setup everything (install, Firefox setup, test script, daemon)")
+
+    # Multi-tor options
+    parser.add_argument("--multi-tor", type=int, help="Setup multiple Tor instances")
+    parser.add_argument("--instance", type=int, help="Specify Tor instance number for operations")
+    parser.add_argument("--list-instances", action="store_true", help="List all available Tor instances")
+    parser.add_argument("--delete-instance", type=int, help="Delete a specific Tor instance")
+    parser.add_argument("--delete-all-instances", action="store_true", help="Delete all Tor instances except the main one")
+
+    # Testing options
+    parser.add_argument("--measure-latency", action="store_true", help="Measure latency difference between direct and Tor connections")
+
+    # SQLMap integration
+    parser.add_argument("--run-sqlmap", action="store_true", help="Run SQLMap through Tor proxy")
+    parser.add_argument("--url", help="Target URL for SQLMap")
+    parser.add_argument("--sqlmap-args", help="Additional SQLMap arguments")
+    parser.add_argument("--create-recover-script", action="store_true", help="Create a script to recover SQLMap if it dies")
+
+    args = parser.parse_args()
+
+    # Check if script is run with root privileges
+    if os.geteuid() != 0:
+        print("[!] This script must be run with root privileges.")
+        print("[!] Please run with sudo or as root.")
+        sys.exit(1)
+
+    # Print banner
+    print("\n" + "=" * 60)
+    print("" + " " * 15 + "Tor Proxy Manager with IP Rotation")
+    print("" + " " * 20 + "CLI-only VPS Edition")
+    print("=" * 60 + "\n")
+
+    # Check if no arguments were provided, show help in that case
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    # Process arguments
+    if args.install:
+        install_packages()
+
+    if args.list_instances:
+        print("[*] Listing all Tor instances...")
+        found_instances = []
+
+        # First, check the main Tor service
+        if check_tor_status():
+            print("[+] Main Tor instance is running on port 9050")
+            found_instances.append({"instance": 0, "port": 9050})
+
+        # Then look for additional instances
+        for i in range(1, 20):  # Check up to 20 possible instances
+            port = 9050 + i
+            config_path = f"/etc/proxychains4.conf.{port}"
+            data_dir = f"/var/lib/tor/instance_{i}"
+
+            if os.path.exists(config_path) or os.path.exists(data_dir):
+                # Check if the instance is running
+                proc_running = False
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.connect(("127.0.0.1", port))
+                        proc_running = True
+                except:
+                    pass
+
+                status = "Running" if proc_running else "Not running"
+                print(f"[+] Tor instance {i} is configured on port {port} ({status})")
+                found_instances.append({"instance": i, "port": port, "running": proc_running})
+
+        if not found_instances:
+            print("[!] No Tor instances found.")
+            print("[!] Create instances with: --multi-tor <number>")
+
+    if args.delete_instance is not None:
+        instance_num = args.delete_instance
+        print(f"[*] Deleting Tor instance {instance_num}...")
+
+        # Stop the instance if it's running
+        port = 9050 + instance_num
+        config_path = f"/etc/proxychains4.conf.{port}"
+        data_dir = f"/var/lib/tor/instance_{instance_num}"
+
+        # Kill the process if it's running
+        run_command(f"pkill -f 'tor -f /etc/tor/torrc.{instance_num}'")
+
+        # Remove the files
+        if os.path.exists(f"/etc/tor/torrc.{instance_num}"):
+            run_command(f"rm /etc/tor/torrc.{instance_num}")
+
+        if os.path.exists(config_path):
+            run_command(f"rm {config_path}")
+
+        if os.path.exists(data_dir):
+            run_command(f"rm -rf {data_dir}")
+
+        print(f"[+] Tor instance {instance_num} deleted.")
+
+    if args.delete_all_instances:
+        print("[*] Deleting all Tor instances except the main one...")
+
+        # Stop all running instances
+        run_command("pkill -f 'tor -f /etc/tor/torrc.[0-9]'")
+
+        # Remove all instance files
+        for i in range(1, 20):  # Handle up to 20 instances
+            # Remove configuration files
+            if os.path.exists(f"/etc/tor/torrc.{i}"):
+                run_command(f"rm /etc/tor/torrc.{i}")
+
+            # Remove proxychains configuration
+            port = 9050 + i
+            if os.path.exists(f"/etc/proxychains4.conf.{port}"):
+                run_command(f"rm /etc/proxychains4.conf.{port}")
+
+            # Remove data directories
+            if os.path.exists(f"/var/lib/tor/instance_{i}"):
+                run_command(f"rm -rf /var/lib/tor/instance_{i}")
+
+        print("[+] All Tor instances deleted.")
+
+    if args.multi_tor:
+        setup_multiple_tor_instances(args.multi_tor)
+
+    if args.measure_latency:
+        proxy_config = None
+        if args.instance is not None:
+            proxy_config = f"/etc/proxychains4.conf.{9050 + args.instance}"
+        measure_latency(proxy_config=proxy_config)
+
+    if args.verify:
+        socks_port = 9050
+        if args.instance is not None:
+            socks_port = 9050 + args.instance
+        verify_tor_connection(socks_port)
+
+    if args.create_test:
+        create_test_script()
+
+    if args.auto_restart:
+        add_crontab_entry(args.interval)
+
+    if args.setup_firefox:
+        setup_firefox_proxy()
+
+    if args.all:
+        install_packages()
+        setup_firefox_proxy()
+        create_test_script()
+        add_crontab_entry(args.interval)
+        # Start daemon at the end
+        args.daemon = True
+
+    if args.status:
+        # Check if we're checking status for a specific instance
+        socks_port = 9050
+        if args.instance is not None:
+            socks_port = 9050 + args.instance
+            print(f"[*] Checking status for Tor instance {args.instance} (port {socks_port})...")
+
+            # Check if instance exists
+            config_path = f"/etc/proxychains4.conf.{socks_port}"
+            if not os.path.exists(config_path):
+                print(f"[!] Tor instance {args.instance} is not configured.")
+                print(f"[!] Create it first with: --multi-tor {args.instance}")
+                return
+        else:
+            print("[*] Checking status for main Tor instance...")
+            if not check_tor_status():
+                print("[!] Tor service is not running.")
+                return
+
+        # Get the current IP
+        ip = get_current_ip(socks_port)
+        if ip:
+            print(f"[+] Current Tor IP: {ip}")
+
+            # Get additional information about the IP
+            proxy_config = "/etc/proxychains4.conf"
+            if args.instance is not None:
+                proxy_config = f"/etc/proxychains4.conf.{socks_port}"
+
+            get_ip_info(proxy_config)
+        else:
+            print("[!] Could not get current Tor IP. Tor may not be working correctly.")
+
+    if args.rotate:
+        instance_num = None
+        if args.instance is not None:
+            instance_num = args.instance
+        rotate_ip(instance_num)
+
+    if args.restart_tor:
+        instance_num = None
+        if args.instance is not None:
+            instance_num = args.instance
+        restart_tor(instance_num)
+
+    if args.daemon:
+        # Check if we should run daemon for a specific instance, all instances, or just the main Tor
+        if args.instance is not None:
+            # Run for a specific instance
+            ip_rotation_daemon(args.interval, args.instance)
+        elif args.multi_tor is not None:
+            # Run for all created instances
+            instances = list(range(1, args.multi_tor + 1))
+            ip_rotation_daemon(args.interval, instances=instances)
+        else:
+            # Run for main Tor
+            ip_rotation_daemon(args.interval)
+
+    if args.run_sqlmap:
+        if not args.url:
+            print("[!] Error: URL is required for SQLMap.")
+            print("[!] Example: --run-sqlmap --url \"http://example.com/page.php?id=1\"")
+            return
+
+        # Build the SQLMap command
+        sqlmap_cmd = f"sqlmap -u \"{args.url}\" --batch --random-agent"
+        if args.sqlmap_args:
+            sqlmap_cmd += f" {args.sqlmap_args}"
+
+        # Determine which Tor instance to use
+        port = 9050
+        if args.instance is not None:
+            port = 9050 + args.instance
+
+        proxychains_conf = "/etc/proxychains4.conf"
+        if args.instance is not None:
+            proxychains_conf = f"/etc/proxychains4.conf.{port}"
+
+        # Run SQLMap through proxychains
+        cmd = f"proxychains4 -f {proxychains_conf} {sqlmap_cmd}"
+        print(f"[*] Running SQLMap through Tor proxy (port {port})...")
+        print(f"[*] Command: {cmd}")
+
+        # Execute the command
+        try:
+            subprocess.call(cmd, shell=True)
+        except KeyboardInterrupt:
+            print("\n[!] SQLMap execution interrupted by user.")
+        except Exception as e:
+            print(f"\n[!] Error running SQLMap: {str(e)}")
+
+    if args.create_recover_script:
+        print("[*] Creating SQLMap recovery script...")
+
+        recovery_script = """#!/bin/bash
+
+    # Script to monitor and restart sqlmap processes if they die
+
+    # Configuration
+    TARGET_URL="$1"
+    SQLMAP_ARGS="$2"
+    TOR_INSTANCE="$3"
+    LOG_DIR="/tmp/sqlmap_logs"
+    ROTATE_INTERVAL=60  # Seconds
+
+    # Check if required arguments are provided
+    if [ -z "$TARGET_URL" ]; then
+    echo "Error: Target URL is required"
+    echo "Usage: $0 <target_url> [sqlmap_args] [tor_instance]"
+    exit 1
+    fi
+
+    # Create log directory
+    mkdir -p "$LOG_DIR"
+
+    # Determine which Tor instance to use
+    if [ -z "$TOR_INSTANCE" ]; then
+    PROXY_PORT=9050
+    PROXY_CONFIG="/etc/proxychains4.conf"
+    else
+    PROXY_PORT=$((9050 + TOR_INSTANCE))
+    PROXY_CONFIG="/etc/proxychains4.conf.$PROXY_PORT"
+    fi
+
+    # Prepare command
+    CMD="proxychains4 -f $PROXY_CONFIG sqlmap -u \"$TARGET_URL\" --batch --random-agent $SQLMAP_ARGS"
+    LOG_FILE="$LOG_DIR/sqlmap_instance_${TOR_INSTANCE:-main}_$(date +%Y%m%d_%H%M%S).log"
+
+    echo "Starting sqlmap with the following configuration:"
+    echo "Target URL: $TARGET_URL"
+    echo "SQLMap Args: $SQLMAP_ARGS"
+    echo "Tor Instance: ${TOR_INSTANCE:-main}"
+    echo "Proxy Port: $PROXY_PORT"
+    echo "Log File: $LOG_FILE"
+    echo "Command: $CMD"
+    echo ""
+
+    # Function to rotate Tor IP
+    rotate_tor_ip() {
+    echo "[$(date)] Rotating Tor IP for instance ${TOR_INSTANCE:-main}..."
+    if [ -z "$TOR_INSTANCE" ]; then
+        sudo python3 ./tor_proxy_setup.py --rotate
+    else
+        sudo python3 ./tor_proxy_setup.py --rotate --instance $TOR_INSTANCE
+    fi
+    }
+
+    # Function to monitor and restart sqlmap
+    monitor_sqlmap() {
+    while true; do
+        echo "[$(date)] Starting sqlmap process..." | tee -a "$LOG_FILE"
+        echo "Command: $CMD" | tee -a "$LOG_FILE"
+
+        # Start sqlmap and get its PID
+        $CMD >> "$LOG_FILE" 2>&1 &
+        SQLMAP_PID=$!
+
+        echo "[$(date)] sqlmap started with PID: $SQLMAP_PID" | tee -a "$LOG_FILE"
+
+        # Monitor the process
+        LAST_ROTATE=$(date +%s)
+        while kill -0 $SQLMAP_PID 2>/dev/null; do
+            NOW=$(date +%s)
+            # Check if it's time to rotate IP
+            if [ $((NOW - LAST_ROTATE)) -ge $ROTATE_INTERVAL ]; then
+                rotate_tor_ip
+                LAST_ROTATE=$NOW
+            fi
+            sleep 5
+        done
+
+        # Process died, check exit status
+        wait $SQLMAP_PID
+        EXIT_STATUS=$?
+
+        echo "[$(date)] sqlmap process exited with status: $EXIT_STATUS" | tee -a "$LOG_FILE"
+
+        if [ $EXIT_STATUS -eq 0 ]; then
+            echo "[$(date)] sqlmap completed successfully." | tee -a "$LOG_FILE"
+            break
+        else
+            echo "[$(date)] sqlmap failed or was interrupted. Restarting in 5 seconds..." | tee -a "$LOG_FILE"
+            sleep 5
+        fi
+    done
+    }
+
+    # Start monitoring in the background so this script can be run with nohup
+    monitor_sqlmap &
+
+    echo "[$(date)] Monitor started in background. Check $LOG_FILE for output."
+    echo "You can safely close this terminal."
+    """
+
+        with open("recover_sqlmap.sh", "w") as f:
+            f.write(recovery_script)
+
+        run_command("chmod +x recover_sqlmap.sh")
+
+        print("[+] SQLMap recovery script created as recover_sqlmap.sh")
+        print("[+] Usage: ./recover_sqlmap.sh <target_url> [sqlmap_args] [tor_instance]")
+        print("[+] Example: ./recover_sqlmap.sh \"http://example.com/page.php?id=1\" \"--dbs --level=5\" 2")
+
+        if __name__ == "__main__":
+            main()
+
+def main():
+    parser = argparse.ArgumentParser(description="Tor Proxy Manager with IP Rotation")
+
+    # Basic options
+    parser.add_argument("--install", action="store_true", help="Install tor, proxychains4, sqlmap and curl")
+    parser.add_argument("--setup-firefox", action="store_true", help="Configure Firefox to use Tor proxy")
+    parser.add_argument("--rotate", action="store_true", help="Rotate Tor IP address once")
+    parser.add_argument("--daemon", action="store_true", help="Run IP rotation daemon")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help=f"IP rotation interval in seconds (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--restart-tor", action="store_true", help="Restart Tor service")
+    parser.add_argument("--status", action="store_true", help="Check Tor status and current IP")
+    parser.add_argument("--auto-restart", action="store_true", help="Setup auto-restart via crontab if script stops")
+    parser.add_argument("--verify", action="store_true", help="Verify Tor connection is working properly")
+    parser.add_argument("--create-test", action="store_true", help="Create a test script to verify Tor connection")
+    parser.add_argument("--all", action="store_true", help="Setup everything (install, Firefox setup, test script, daemon)")
+
+    # Multi-tor options
+    parser.add_argument("--multi-tor", type=int, help="Setup multiple Tor instances")
+    parser.add_argument("--instance", type=int, help="Specify Tor instance number for operations")
+    parser.add_argument("--list-instances", action="store_true", help="List all available Tor instances")
+    parser.add_argument("--delete-instance", type=int, help="Delete a specific Tor instance")
+    parser.add_argument("--delete-all-instances", action="store_true", help="Delete all Tor instances except the main one")
+
+    # Testing options
+    parser.add_argument("--measure-latency", action="store_true", help="Measure latency difference between direct and Tor connections")
+
+    # SQLMap integration
+    parser.add_argument("--run-sqlmap", action="store_true", help="Run SQLMap through Tor proxy")
+    parser.add_argument("--url", help="Target URL for SQLMap")
+    parser.add_argument("--sqlmap-args", help="Additional SQLMap arguments")
+    parser.add_argument("--create-recover-script", action="store_true", help="Create a script to recover SQLMap if it dies")
+
+    args = parser.parse_args()
+
+    # Check if script is run with root privileges
+    if os.geteuid() != 0:
+        print("[!] This script must be run with root privileges.")
+        print("[!] Please run with sudo or as root.")
+        sys.exit(1)
+
+    # Print banner
+    print("\n" + "=" * 60)
+    print("" + " " * 15 + "Tor Proxy Manager with IP Rotation")
+    print("" + " " * 20 + "CLI-only VPS Edition")
+    print("=" * 60 + "\n")
+
+    # Check if no arguments were provided, show help in that case
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    # Process arguments
+    if args.install:
+        install_packages()
+
+    if args.list_instances:
+        print("[*] Listing all Tor instances...")
+        found_instances = []
+
+        # First, check the main Tor service
+        if check_tor_status():
+            print("[+] Main Tor instance is running on port 9050")
+            found_instances.append({"instance": 0, "port": 9050})
+
+        # Then look for additional instances
+        for i in range(1, 20):  # Check up to 20 possible instances
+            port = 9050 + i
+            config_path = f"/etc/proxychains4.conf.{port}"
+            data_dir = f"/var/lib/tor/instance_{i}"
+
+            if os.path.exists(config_path) or os.path.exists(data_dir):
+                # Check if the instance is running
+                proc_running = False
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.connect(("127.0.0.1", port))
+                        proc_running = True
+                except:
+                    pass
+
+                status = "Running" if proc_running else "Not running"
+                print(f"[+] Tor instance {i} is configured on port {port} ({status})")
+                found_instances.append({"instance": i, "port": port, "running": proc_running})
+
+        if not found_instances:
+            print("[!] No Tor instances found.")
+            print("[!] Create instances with: --multi-tor <number>")
+
+    if args.delete_instance is not None:
+        instance_num = args.delete_instance
+        print(f"[*] Deleting Tor instance {instance_num}...")
+
+        # Stop the instance if it's running
+        port = 9050 + instance_num
+        config_path = f"/etc/proxychains4.conf.{port}"
+        data_dir = f"/var/lib/tor/instance_{instance_num}"
+
+        # Kill the process if it's running
+        run_command(f"pkill -f 'tor -f /etc/tor/torrc.{instance_num}'")
+
+        # Remove the files
+        if os.path.exists(f"/etc/tor/torrc.{instance_num}"):
+            run_command(f"rm /etc/tor/torrc.{instance_num}")
+
+        if os.path.exists(config_path):
+            run_command(f"rm {config_path}")
+
+        if os.path.exists(data_dir):
+            run_command(f"rm -rf {data_dir}")
+
+        print(f"[+] Tor instance {instance_num} deleted.")
+
+    if args.delete_all_instances:
+        print("[*] Deleting all Tor instances except the main one...")
+
+        # Stop all running instances
+        run_command("pkill -f 'tor -f /etc/tor/torrc.[0-9]'")
+
+        # Remove all instance files
+        for i in range(1, 20):  # Handle up to 20 instances
+            # Remove configuration files
+            if os.path.exists(f"/etc/tor/torrc.{i}"):
+                run_command(f"rm /etc/tor/torrc.{i}")
+
+            # Remove proxychains configuration
+            port = 9050 + i
+            if os.path.exists(f"/etc/proxychains4.conf.{port}"):
+                run_command(f"rm /etc/proxychains4.conf.{port}")
+
+            # Remove data directories
+            if os.path.exists(f"/var/lib/tor/instance_{i}"):
+                run_command(f"rm -rf /var/lib/tor/instance_{i}")
+
+        print("[+] All Tor instances deleted.")
+
+    if args.multi_tor:
+        setup_multiple_tor_instances(args.multi_tor)
+
+    if args.measure_latency:
+        proxy_config = None
+        if args.instance is not None:
+            proxy_config = f"/etc/proxychains4.conf.{9050 + args.instance}"
+        measure_latency(proxy_config=proxy_config)
+
+    if args.verify:
+        socks_port = 9050
+        if args.instance is not None:
+            socks_port = 9050 + args.instance
+        verify_tor_connection(socks_port)
+
+    if args.create_test:
+        create_test_script()
+
+    if args.auto_restart:
+        add_crontab_entry(args.interval)
+
+    if args.setup_firefox:
+        setup_firefox_proxy()
+
+    if args.all:
+        install_packages()
+        setup_firefox_proxy()
+        create_test_script()
+        add_crontab_entry(args.interval)
+        # Start daemon at the end
+        args.daemon = True
+
+    if args.status:
+        # Check if we're checking status for a specific instance
+        socks_port = 9050
+        if args.instance is not None:
+            socks_port = 9050 + args.instance
+            print(f"[*] Checking status for Tor instance {args.instance} (port {socks_port})...")
+
+            # Check if instance exists
+            config_path = f"/etc/proxychains4.conf.{socks_port}"
+            if not os.path.exists(config_path):
+                print(f"[!] Tor instance {args.instance} is not configured.")
+                print(f"[!] Create it first with: --multi-tor {args.instance}")
+                return
+        else:
+            print("[*] Checking status for main Tor instance...")
+            if not check_tor_status():
+                print("[!] Tor service is not running.")
+                return
+
+        # Get the current IP
+        ip = get_current_ip(socks_port)
+        if ip:
+            print(f"[+] Current Tor IP: {ip}")
+
+            # Get additional information about the IP
+            proxy_config = "/etc/proxychains4.conf"
+            if args.instance is not None:
+                proxy_config = f"/etc/proxychains4.conf.{socks_port}"
+
+            get_ip_info(proxy_config)
+        else:
+            print("[!] Could not get current Tor IP. Tor may not be working correctly.")
+
+    if args.rotate:
+        instance_num = None
+        if args.instance is not None:
+            instance_num = args.instance
+        rotate_ip(instance_num)
+
+    if args.restart_tor:
+        instance_num = None
+        if args.instance is not None:
+            instance_num = args.instance
+        restart_tor(instance_num)
+
+    if args.daemon:
+        # Check if we should run daemon for a specific instance, all instances, or just the main Tor
+        if args.instance is not None:
+            # Run for a specific instance
+            ip_rotation_daemon(args.interval, args.instance)
+        elif args.multi_tor is not None:
+            # Run for all created instances
+            instances = list(range(1, args.multi_tor + 1))
+            ip_rotation_daemon(args.interval, instances=instances)
+        else:
+            # Run for main Tor
+            ip_rotation_daemon(args.interval)
+
+    if args.run_sqlmap:
+        if not args.url:
+            print("[!] Error: URL is required for SQLMap.")
+            print("[!] Example: --run-sqlmap --url \"http://example.com/page.php?id=1\"")
+            return
+
+        # Build the SQLMap command
+        sqlmap_cmd = f"sqlmap -u \"{args.url}\" --batch --random-agent"
+        if args.sqlmap_args:
+            sqlmap_cmd += f" {args.sqlmap_args}"
+
+        # Determine which Tor instance to use
+        port = 9050
+        if args.instance is not None:
+            port = 9050 + args.instance
+
+        proxychains_conf = "/etc/proxychains4.conf"
+        if args.instance is not None:
+            proxychains_conf = f"/etc/proxychains4.conf.{port}"
+
+        # Run SQLMap through proxychains
+        cmd = f"proxychains4 -f {proxychains_conf} {sqlmap_cmd}"
+        print(f"[*] Running SQLMap through Tor proxy (port {port})...")
+        print(f"[*] Command: {cmd}")
+
+        # Execute the command
+        try:
+            subprocess.call(cmd, shell=True)
+        except KeyboardInterrupt:
+            print("\n[!] SQLMap execution interrupted by user.")
+        except Exception as e:
+            print(f"\n[!] Error running SQLMap: {str(e)}")
+
+    if args.create_recover_script:
+        print("[*] Creating SQLMap recovery script...")
+
+        recovery_script = """#!/bin/bash
+
+# Script to monitor and restart sqlmap processes if they die
+
+# Configuration
+TARGET_URL="$1"
+SQLMAP_ARGS="$2"
+TOR_INSTANCE="$3"
+LOG_DIR="/tmp/sqlmap_logs"
+ROTATE_INTERVAL=60  # Seconds
+
+# Check if required arguments are provided
+if [ -z "$TARGET_URL" ]; then
+    echo "Error: Target URL is required"
+    echo "Usage: $0 <target_url> [sqlmap_args] [tor_instance]"
+    exit 1
+fi
+
+# Create log directory
+mkdir -p "$LOG_DIR"
+
+# Determine which Tor instance to use
+if [ -z "$TOR_INSTANCE" ]; then
+    PROXY_PORT=9050
+    PROXY_CONFIG="/etc/proxychains4.conf"
+else
+    PROXY_PORT=$((9050 + TOR_INSTANCE))
+    PROXY_CONFIG="/etc/proxychains4.conf.$PROXY_PORT"
+fi
+
+# Prepare command
+CMD="proxychains4 -f $PROXY_CONFIG sqlmap -u \"$TARGET_URL\" --batch --random-agent $SQLMAP_ARGS"
+LOG_FILE="$LOG_DIR/sqlmap_instance_${TOR_INSTANCE:-main}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "Starting sqlmap with the following configuration:"
+echo "Target URL: $TARGET_URL"
+echo "SQLMap Args: $SQLMAP_ARGS"
+echo "Tor Instance: ${TOR_INSTANCE:-main}"
+echo "Proxy Port: $PROXY_PORT"
+echo "Log File: $LOG_FILE"
+echo "Command: $CMD"
+echo ""
+
+# Function to rotate Tor IP
+rotate_tor_ip() {
+    echo "[$(date)] Rotating Tor IP for instance ${TOR_INSTANCE:-main}..."
+    if [ -z "$TOR_INSTANCE" ]; then
+        sudo python3 ./tor_proxy_setup.py --rotate
+    else
+        sudo python3 ./tor_proxy_setup.py --rotate --instance $TOR_INSTANCE
+    fi
+}
+
+# Function to monitor and restart sqlmap
+monitor_sqlmap() {
+    while true; do
+        echo "[$(date)] Starting sqlmap process..." | tee -a "$LOG_FILE"
+        echo "Command: $CMD" | tee -a "$LOG_FILE"
+
+        # Start sqlmap and get its PID
+        $CMD >> "$LOG_FILE" 2>&1 &
+        SQLMAP_PID=$!
+
+        echo "[$(date)] sqlmap started with PID: $SQLMAP_PID" | tee -a "$LOG_FILE"
+
+        # Monitor the process
+        LAST_ROTATE=$(date +%s)
+        while kill -0 $SQLMAP_PID 2>/dev/null; do
+            NOW=$(date +%s)
+            # Check if it's time to rotate IP
+            if [ $((NOW - LAST_ROTATE)) -ge $ROTATE_INTERVAL ]; then
+                rotate_tor_ip
+                LAST_ROTATE=$NOW
+            fi
+            sleep 5
+        done
+
+        # Process died, check exit status
+        wait $SQLMAP_PID
+        EXIT_STATUS=$?
+
+        echo "[$(date)] sqlmap process exited with status: $EXIT_STATUS" | tee -a "$LOG_FILE"
+
+        if [ $EXIT_STATUS -eq 0 ]; then
+            echo "[$(date)] sqlmap completed successfully." | tee -a "$LOG_FILE"
+            break
+        else
+            echo "[$(date)] sqlmap failed or was interrupted. Restarting in 5 seconds..." | tee -a "$LOG_FILE"
+            sleep 5
+        fi
+    done
+}
+
+# Start monitoring in the background so this script can be run with nohup
+monitor_sqlmap &
+
+echo "[$(date)] Monitor started in background. Check $LOG_FILE for output."
+echo "You can safely close this terminal."
+"""
+
+        with open("recover_sqlmap.sh", "w") as f:
+            f.write(recovery_script)
+
+        run_command("chmod +x recover_sqlmap.sh")
+
+        print("[+] SQLMap recovery script created as recover_sqlmap.sh")
+        print("[+] Usage: ./recover_sqlmap.sh <target_url> [sqlmap_args] [tor_instance]")
+        print("[+] Example: ./recover_sqlmap.sh \"http://example.com/page.php?id=1\" \"--dbs --level=5\" 2")
+
+if __name__ == "__main__":
+    main()
 import os
 import sys
 import time
@@ -176,7 +1854,7 @@ def setup_multiple_tor_instances(num_instances=5):
     print(f"[+] Successfully set up {num_instances} Tor instances")
     return instance_info
 
-    def verify_tor_connection():
+def verify_tor_connection():
     """Verify that Tor connection is working properly"""
     print("[*] Verifying Tor connection...")
 
@@ -210,7 +1888,7 @@ def setup_multiple_tor_instances(num_instances=5):
     print(f"[+] Tor connection verified! Your Tor IP is: {ip}")
     return True
 
-    def rotate_ip(instance_num=None, control_port=9051):
+def rotate_ip(instance_num=None, control_port=9051):
     """Rotate Tor IP address for a specific instance or main Tor"""
     socks_port = 9050
     if instance_num is not None:
@@ -279,7 +1957,7 @@ firefox -no-remote -profile "$(mktemp -d)" \
     print(f"[+] Firefox proxy setup completed. Run '{firefox_script_path}' to launch Firefox with Tor proxy.")
     print("[+] Note: This is a CLI-only solution for VPS as requested.")
 
-def create_test_script():
+def create_test_script(interval=None, instances=None, instance_num=None):
     """Create a script to test Tor connection and show IP info"""
     print("[*] Creating test connection script...")
 
@@ -476,7 +2154,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
 
     print(f"[+] Test script created. Run '{test_script_path}' to verify your Tor connection.")
 
-    def ip_rotation_daemon(interval=60, instance_num=None, instances=None):
+def ip_rotation_daemon(interval=60, instance_num=None, instances=None):
     """Run IP rotation daemon that changes the Tor IP at specified intervals"""
     if instance_num is not None:
         # Single instance rotation
@@ -530,7 +2208,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
         except KeyboardInterrupt:
             print("\n[*] IP rotation daemon stopped.")
 
-    def add_crontab_entry(interval=60):
+def add_crontab_entry(interval=60):
     """Add crontab entry to auto-restart the script if it stops"""
     print("[*] Setting up auto-restart via crontab...")
     script_path = os.path.abspath(__file__)
@@ -555,7 +2233,8 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
 
     print("[+] Auto-restart crontab entry added. The script will automatically restart if it stops.")
 
-    def main():
+def main():
+    global avg_direct
     parser = argparse.ArgumentParser(description="Tor Proxy Manager")
     parser.add_argument("--install", action="store_true", help="Install tor, proxychains4, sqlmap and curl")
     parser.add_argument("--setup-firefox", action="store_true", help="Configure Firefox to use Tor proxy")
@@ -596,17 +2275,17 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
     if args.install:
         install_packages()
 
-    if args.setup_firefox:
-        setup_firefox_proxy()
+        if args.setup_firefox:
+            setup_firefox_proxy()
 
-    if args.create_test:
-        create_test_script()
+        if args.create_test:
+            create_test_script()
 
-    if args.restart_tor:
-        if args.instance:
-            restart_tor(args.instance)
-        else:
-            restart_tor()
+        if args.restart_tor:
+            if args.instance:
+                restart_tor(args.instance)
+            else:
+                restart_tor()
 
     if args.status:
         if args.instance:
@@ -628,7 +2307,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
 
     if args.rotate:
         if args.instance:
-            rotate_ip(args.instance)
+                rotate_ip(args.instance)
         else:
             rotate_ip()
 
@@ -639,7 +2318,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
             return
         instances = setup_multiple_tor_instances(num_instances)
 
-        # If daemon is also specified, start rotation daemon for all instances
+        # If daemon is also specified, start a rotation daemon for all instances
         if args.daemon:
             ip_rotation_daemon(args.interval, instances=instances)
 
@@ -649,10 +2328,10 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
         else:
             ip_rotation_daemon(args.interval)
 
-    if args.run_sqlmap:
-        if not args.url:
-            print("[!] URL is required for sqlmap scanning")
-            return
+        if args.run_sqlmap:
+            if not args.url:
+                print("[!] URL is required for sqlmap scanning")
+                return
 
         sqlmap_args = args.sqlmap_args if args.sqlmap_args else ""
         port = 9050 + args.instance if args.instance else 9050
@@ -665,7 +2344,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
         run_command(f"nohup {cmd} > /tmp/sqlmap_{port}.log 2>&1 &")
         print(f"[+] sqlmap started in background. Check /tmp/sqlmap_{port}.log for output")
 
-            if args.list_instances:
+    if args.list_instances:
         # Get all proxy instances
         print("\n[*] Listing all Tor proxy instances...")
 
@@ -693,11 +2372,11 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
         if not found_instances:
             print("No additional Tor instances found.")
 
-            if args.delete_instance is not None:
-        instance_num = args.delete_instance
-        if instance_num <= 0:
-            print("[!] Cannot delete the main Tor service. Instance number must be > 0")
-            return
+        if args.delete_instance is not None:
+            instance_num = args.delete_instance
+            if instance_num <= 0:
+                print("[!] Cannot delete the main Tor service. Instance number must be > 0")
+                return
 
         port = 9050 + instance_num
         config_path = f"/etc/proxychains4.conf.{port}"
@@ -722,7 +2401,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
 
         print(f"[+] Tor instance {instance_num} deleted.")
 
-            if args.delete_all_instances:
+    if args.delete_all_instances:
         print("[*] Deleting all additional Tor instances...")
 
         # Kill all Tor processes except the main service
@@ -741,7 +2420,7 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
 
         print("[+] All additional Tor instances deleted.")
 
-            if args.measure_latency:
+    if args.measure_latency:
         # Measure latency to a common website
         test_url = "https://api.ipify.org"
         num_tests = 3
@@ -802,11 +2481,11 @@ echo "sudo python3 proxy_tester.py --test-instance ${INSTANCE:-0} --verbose"
             if direct_times:  # Calculate overhead if we have both measurements
                 overhead = ((avg_tor / avg_direct) - 1) * 100
                 print(f"  Tor overhead: {overhead:.1f}%")
-        else:
-            print("  Could not measure Tor latency.")
+            else:
+                print("  Could not measure Tor latency.")
 
 if __name__ == "__main__":
-    # Check if script is run with root privileges
+    # Check if a script is run with root privileges
     if os.geteuid() != 0:
         print("[!] This script requires root privileges to install packages and configure services.")
         print("[!] Please run with sudo or as root.")
