@@ -39,7 +39,9 @@ def run_command(command, timeout=30):
         return "TIMEOUT"
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {command}")
-        print(f"Error message: {e.stderr}")
+        if hasattr(e, 'stderr') and e.stderr:
+            if hasattr(e, 'stderr') and e.stderr:
+                print(f"Error message: {e.stderr}")
         return None
 
 def get_proxy_instances():
